@@ -1,0 +1,144 @@
+#!/usr/bin/perl
+
+# Usage: PID=<pid> track-fds <strace-log>
+#
+# This will scan through the log and figure out where each file descriptor of
+# pid <pid> came from. If file descriptors are closed, their original origin
+# will be reported. If a file descriptor is reused for something else, then the
+# previous target will be lost forever and your computer will cackle in
+# merriment as you scream your frustration to the stars. That's because this is
+# a total hack, and probably shouldn't be uploaded for the public to see and
+# laugh at.
+#
+# Laugh all you want, you fools. I will show you all someday.
+#
+# Perhaps by allowing you to specify a line number, and reporting what was
+# active at that line of the strace log? Nah, you can do that yourself already:
+#
+#   head -<pid> | env PID=<pid> track-fds
+#
+# So go away now.
+
+use strict;
+use warnings;
+
+my %fd;
+my %exec;
+my %lines;
+my %dupfd;
+
+my $first = 0;
+my $line;
+while(<>) {
+    chomp;
+    $line = $_;
+    my $pid;
+    if (s/(\d+) *//) {
+        $pid = $1;
+    } else {
+        print "Warning: line $.\n";
+        next;
+    }
+
+    if (!$first++) {
+        $fd{$pid}{0} = "original-stdin";
+        $fd{$pid}{1} = "original-stdout";
+        $fd{$pid}{2} = "original-stderr";
+    }
+
+    if (/^(?:open|accept|socket)\(.*= (\d+)$/) {
+        handle_open($pid, $1);
+    } elsif (/open resumed.*= (\d+)$/) {
+        handle_open($pid, $1);
+    } elsif (/^dup\((\d+).*= (\d+)$/) {
+        handle_dup($pid, $1, $2);
+    } elsif (/^dup2\((\d+), (\d+)/) {
+        handle_dup2($pid, $1, $2);
+    } elsif (/^execve\((.*)/) {
+        handle_exec($pid, $1);
+    } elsif (/^(?:v?)fork\(\)\s*= (\d+)/ || /fork resumed.*= (\d+)$/) {
+        handle_fork($pid, $1);
+    } elsif (/^clone\(.*= (\d+)$/ || /clone resumed.*= (\d+)$/) {
+        handle_fork($pid, $1);
+    } elsif (/^(?:pipe|pipe2|socketpair).*\[(\d+), (\d+)\]/) {
+        handle_pipe($pid, $1, $2);
+    } elsif (/(?:pipe|pipe2|socketpair) resumed> \[(\d+), (\d+)/) {
+        handle_pipe($pid, $1, $2);
+    } elsif (/^close\((\d+)/) {
+        handle_close($pid, $1);
+    } elsif (/^fcntl\((\d+), F_DUPFD/) {
+        my $src = $1;
+        if (/= (\d+)$/) {
+            handle_dup2($pid, $src, $1);
+        } else {
+            $dupfd{$pid} = $src;
+        }
+    } elsif (/fcntl resumed.*= (\d+)$/ && exists $dupfd{$pid}) {
+        handle_dup2($pid, $dupfd{$pid}, $1);
+        delete $dupfd{$pid};
+    }
+}
+
+sub handle_open {
+    my ($pid, $fd) = @_;
+    $fd{$pid}{$fd} = "line $.";
+    $lines{$.} = $line;
+}
+
+sub handle_close {
+    my ($pid, $fd) = @_;
+    $fd{$pid}{$fd} = "closed$.($fd{$pid}{$fd})";
+}
+
+sub handle_dup {
+    my ($pid, $src, $dst) = @_;
+    $fd{$pid}{$dst} = "dup($fd{$pid}{$src})";
+}
+
+sub handle_dup2 {
+    my ($pid, $src, $dst) = @_;
+    $fd{$pid}{$dst} = "dup2($fd{$pid}{$src})";
+}
+
+sub handle_pipe {
+    my ($pid, $src, $dst) = @_;
+    $fd{$pid}{$src} = "readpipe from process $exec{$pid}";
+    $fd{$pid}{$dst} = "writepipe from process $exec{$pid}";
+}
+
+sub handle_exec {
+    my ($pid, $line) = @_;
+    $exec{$pid} = "eline $.";
+    $lines{$.} = $line;
+}
+
+sub handle_fork {
+    my ($oldpid, $newpid) = @_;
+    $exec{$newpid} = "fork($exec{$oldpid})";
+    while (my ($fd, $desc) = each %{ $fd{$oldpid} }) {
+        $fd{$newpid}{$fd} = "inherit-$oldpid($desc)" unless $desc =~ /^closed/;
+        #$fd{$newpid}{$fd} = "inherit($desc)";
+    }
+}
+
+my $pid = $ENV{PID} || 21515;
+print "in $exec{$pid}:";
+if ($exec{$pid} =~ /line (\d+)/) {
+    print " $1: $lines{$1}";
+}
+print "\n";
+for my $fd (sort { $a <=> $b } keys %{ $fd{$pid} }) {
+    my $desc = $fd{$pid}{$fd};
+    print "  fd $fd is $desc\n";
+    while ($desc =~ /line (\d+)/g) {
+        print "    $1: $lines{$1}\n";
+    }
+    while ($desc =~ /inherit-(\d+)/g) {
+        my $ppid = $1;
+        #print "    pid($ppid)=$exec{$ppid}\n";
+        while ($exec{$ppid} =~ /line (\d+)/g) {
+            print "    $1: (pid$ppid) $lines{$1}\n";
+        }
+    }
+}
+
